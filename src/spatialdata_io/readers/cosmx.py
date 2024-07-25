@@ -110,15 +110,18 @@ def cosmx(
     if not labels_dir.exists():
         raise FileNotFoundError(f"Labels directory not found: {labels_dir}.")
 
-    counts = pd.read_csv(path / counts_file, header=0, index_col=CosmxKeys.INSTANCE_KEY)
-    counts.index = counts.index.astype(str).str.cat(counts.pop(CosmxKeys.FOV).astype(str).values, sep="_")
+    # counts = pd.read_csv(path / counts_file, header=0, index_col=CosmxKeys.INSTANCE_KEY)
+    counts = pd.read_csv(path / counts_file, header=0, index_col='cell')
+    counts = counts.drop([CosmxKeys.FOV, CosmxKeys.INSTANCE_KEY], axis =1)
+    # counts.index = counts.index.astype(str).str.cat(counts.pop(CosmxKeys.FOV).astype(str).values, sep="_")
 
-    obs = pd.read_csv(path / meta_file, header=0, index_col=CosmxKeys.INSTANCE_KEY)
+    # obs = pd.read_csv(path / meta_file, header=0, index_col=CosmxKeys.INSTANCE_KEY)
+    obs = pd.read_csv(path / meta_file, header=0, index_col='cell')
     obs[CosmxKeys.FOV] = pd.Categorical(obs[CosmxKeys.FOV].astype(str))
     obs[CosmxKeys.REGION_KEY] = pd.Categorical(obs[CosmxKeys.FOV].astype(str).apply(lambda s: s + "_labels"))
-    obs[CosmxKeys.INSTANCE_KEY] = obs.index.astype(np.int64)
+    # obs[CosmxKeys.INSTANCE_KEY] = obs.index.astype(np.int64)
     obs.rename_axis(None, inplace=True)
-    obs.index = obs.index.astype(str).str.cat(obs[CosmxKeys.FOV].values, sep="_")
+    # obs.index = obs.index.astype(str).str.cat(obs[CosmxKeys.FOV].values, sep="_")
 
     common_index = obs.index.intersection(counts.index)
 
@@ -140,10 +143,16 @@ def cosmx(
 
     affine_transforms_to_global = {}
 
+    problematic_fovs = []
+
     for fov in fovs_counts:
         idx = table.obs.fov.astype(str) == fov
         loc = table[idx, :].obs[[CosmxKeys.X_LOCAL_CELL, CosmxKeys.Y_LOCAL_CELL]].values
         glob = table[idx, :].obs[[CosmxKeys.X_GLOBAL_CELL, CosmxKeys.Y_GLOBAL_CELL]].values
+        if len(loc) < 3 or len(glob) < 3:
+            print(f"Skipping FOV {fov}")
+            problematic_fovs.append(fov)
+            continue
         out = estimate_transform(ttype="affine", src=loc, dst=glob)
         affine_transforms_to_global[fov] = Affine(
             # out.params, input_coordinate_system=input_cs, output_coordinate_system=output_cs
@@ -151,6 +160,9 @@ def cosmx(
             input_axes=("x", "y"),
             output_axes=("x", "y"),
         )
+
+    # remove problematic fovs
+    fovs_counts[:] = [fov for fov in fovs_counts if fov not in problematic_fovs]
 
     table.obsm["global"] = table.obs[[CosmxKeys.X_GLOBAL_CELL, CosmxKeys.Y_GLOBAL_CELL]].to_numpy()
     table.obsm["spatial"] = table.obs[[CosmxKeys.X_LOCAL_CELL, CosmxKeys.Y_LOCAL_CELL]].to_numpy()
@@ -177,7 +189,8 @@ def cosmx(
     fovs_images_and_labels = set(fovs_images).intersection(set(fovs_labels))
     fovs_diff = fovs_images_and_labels.difference(set(fovs_counts))
     if len(fovs_diff):
-        raise logger.warning(
+        print(
+        # raise logger.warning(
             f"Found images and labels for {len(fovs_images)} FOVs, but only {len(fovs_counts)} FOVs in the counts file.\n"
             + f"The following FOVs are missing: {fovs_diff} \n"
             + "... will use only fovs in Table."
@@ -231,27 +244,27 @@ def cosmx(
 
     points: dict[str, DaskDataFrame] = {}
     if transcripts:
-        # assert transcripts_file is not None
-        # from pyarrow.csv import read_csv
-        #
-        # ptable = read_csv(path / transcripts_file)  # , header=0)
-        # for fov in fovs_counts:
-        #     aff = affine_transforms_to_global[fov]
-        #     sub_table = ptable.filter(pa.compute.equal(ptable.column(CosmxKeys.FOV), int(fov))).to_pandas()
-        #     sub_table[CosmxKeys.INSTANCE_KEY] = sub_table[CosmxKeys.INSTANCE_KEY].astype("category")
-        #     # we rename z because we want to treat the data as 2d
-        #     sub_table.rename(columns={"z": "z_raw"}, inplace=True)
-        #     points[fov] = PointsModel.parse(
-        #         sub_table,
-        #         coordinates={"x": CosmxKeys.X_LOCAL_TRANSCRIPT, "y": CosmxKeys.Y_LOCAL_TRANSCRIPT},
-        #         feature_key=CosmxKeys.TARGET_OF_TRANSCRIPT,
-        #         instance_key=CosmxKeys.INSTANCE_KEY,
-        #         transformations={
-        #             fov: Identity(),
-        #             "global": aff,
-        #             "global_only_labels": aff,
-        #         },
-        #     )
+        assert transcripts_file is not None
+        from pyarrow.csv import read_csv
+        
+        ptable = read_csv(path / transcripts_file)  # , header=0)
+        for fov in fovs_counts:
+            aff = affine_transforms_to_global[fov]
+            sub_table = ptable.filter(pa.compute.equal(ptable.column(CosmxKeys.FOV), int(fov))).to_pandas()
+            sub_table[CosmxKeys.INSTANCE_KEY] = sub_table[CosmxKeys.INSTANCE_KEY].astype("category")
+            # we rename z because we want to treat the data as 2d
+            sub_table.rename(columns={"z": "z_raw"}, inplace=True)
+            points[fov] = PointsModel.parse(
+                sub_table,
+                coordinates={"x": CosmxKeys.X_LOCAL_TRANSCRIPT, "y": CosmxKeys.Y_LOCAL_TRANSCRIPT},
+                feature_key=CosmxKeys.TARGET_OF_TRANSCRIPT,
+                instance_key=CosmxKeys.INSTANCE_KEY,
+                transformations={
+                    fov: Identity(),
+                    "global": aff,
+                    "global_only_labels": aff,
+                },
+            )
         # let's convert the .csv to .parquet and let's read it with pyarrow.parquet for faster subsetting
         import tempfile
 
